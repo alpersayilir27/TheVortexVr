@@ -105,3 +105,11 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# Claude/VR Arena one-shot sentinel (not source — local signal to auto-runner)
+/[Aa]ssets/[Ee]ditor/.vr-arena-pending-setup
+/[Aa]ssets/[Ee]ditor/.vr-arena-pending-setup.meta
+
+# Unity auto-recovery dump
+/[Aa]ssets/_[Rr]ecovery/
+/[Aa]ssets/_[Rr]ecovery.meta
