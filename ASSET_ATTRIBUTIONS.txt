@@ -1,0 +1,10 @@
+
+# Tactical Gloves
+# Source FBX: Assets/Models/Hands/source/tactical gloves 3d model.glb
+# License: Creative Commons Attribution (CC-BY 4.0)
+# Author: see Sketchfab page — credit creator in your build's credits screen.
+
+# Animated Zombie
+# Source: Assets/Models/Zombie/Zombie.glb (downloaded from poly.pizza)
+# License: Creative Commons Attribution (CC-BY 3.0)
+# Author: Quaternius — must credit in your build's credits screen.

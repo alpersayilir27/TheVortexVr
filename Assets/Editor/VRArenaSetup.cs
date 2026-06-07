@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEditor;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using Oculus.Interaction;
 using TMPro;
@@ -37,7 +38,36 @@ public static class VRArenaSetup
         {
             Debug.Log("[VRArenaSetup] Sentinel detected — auto-running Setup Weapon System after script reload.");
             string content = File.ReadAllText(SentinelPath);
-            SetupWeaponSystem();
+            if (content.Contains("synthetic-hands-only"))
+            {
+                // Light path: only do hands, skip full weapon-system rebuild
+                SetupSyntheticHands();
+            }
+            else if (content.Contains("tactical-gloves-only"))
+            {
+                ApplyTacticalGloveLook();
+            }
+            else if (content.Contains("tactical-arms-only"))
+            {
+                InstallTacticalGlovesFromZip();
+            }
+            else if (content.Contains("revert-hands"))
+            {
+                RevertHandsToDefault();
+            }
+            else
+            {
+                SetupWeaponSystem();
+                if (content.Contains("synthetic-hands")) SetupSyntheticHands();
+            }
+            if (content.Contains("tactical-gloves") && !content.Contains("tactical-gloves-only"))
+            {
+                ApplyTacticalGloveLook();
+            }
+            if (content.Contains("tactical-arms") && !content.Contains("tactical-arms-only"))
+            {
+                InstallTacticalGlovesFromZip();
+            }
             if (content.Contains("flip-weapon")) { FlipWeapon180(); Debug.Log("[VRArenaSetup] Sentinel said flip-weapon — flipped model 180°."); }
             if (content.Contains("recenter-muzzle")) { RecenterMuzzle(); Debug.Log("[VRArenaSetup] Sentinel said recenter-muzzle — recenterd Muzzle."); }
             UnityEditor.SceneManagement.EditorSceneManager.SaveOpenScenes();
@@ -1239,5 +1269,583 @@ public static class VRArenaSetup
             forend.position = forendWorld + weapon.transform.forward * offsetWorld.z;
             forend.rotation = weapon.transform.rotation;
         }
+    }
+
+    // ---------- Synthetic Hands (CS:GO-style: controllers hidden, gloved hands shown) ----------
+
+    private const string SyntheticHandsBlockDataGuid = "1e4a3f91312cbb042a301e514935092f";
+    private const string BBLeftHandSyntheticGuid     = "81b0c6f02d961984eb074b9834c049ae";
+    private const string BBRightHandSyntheticGuid    = "392af43851d822242be5b1ae72b35b46";
+
+    [MenuItem("Tools/VR Arena/Setup Synthetic Hands (hide controllers)")]
+    public static void SetupSyntheticHands()
+    {
+        // Try the official Meta BB install path first (handles auto-wiring of HandVisual children)
+        bool installedViaBlockData = TryInstallSyntheticHandsViaBlockData();
+
+        if (!installedViaBlockData)
+        {
+            Debug.LogWarning("[VRArenaSetup] BB install path failed — falling back to manual prefab instantiation.");
+            ManualInstallSyntheticHands();
+        }
+
+        EnableMultimodalControllerDrivenHands();
+        UnityEditor.SceneManagement.EditorSceneManager.MarkAllScenesDirty();
+        Debug.Log("[VRArenaSetup] Synthetic hands installed. Controllers will display as gloved hands; trigger/grip animate fingers.");
+    }
+
+    private static bool TryInstallSyntheticHandsViaBlockData()
+    {
+        try
+        {
+            string assetPath = AssetDatabase.GUIDToAssetPath(SyntheticHandsBlockDataGuid);
+            if (string.IsNullOrEmpty(assetPath)) return false;
+            ScriptableObject blockData = AssetDatabase.LoadAssetAtPath<ScriptableObject>(assetPath);
+            if (blockData == null) return false;
+
+            // Find Meta.XR.BuildingBlocks.Editor.BlockData type (base class) — has InstallWithDependencies (internal async)
+            System.Type t = blockData.GetType();
+            MethodInfo install = null;
+            while (t != null && install == null)
+            {
+                install = t.GetMethod("InstallWithDependencies",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                    null, new System.Type[] { typeof(GameObject) }, null);
+                t = t.BaseType;
+            }
+            if (install == null) return false;
+
+            object taskObj = install.Invoke(blockData, new object[] { null });
+            // Drive the Task to completion synchronously
+            var task = taskObj as System.Threading.Tasks.Task;
+            if (task != null)
+            {
+                // Pump editor delayCalls while we wait — avoid full Wait() which can deadlock with editor main thread tasks
+                int safety = 200;
+                while (!task.IsCompleted && safety-- > 0)
+                {
+                    System.Threading.Thread.Sleep(10);
+                }
+                if (task.IsFaulted)
+                {
+                    Debug.LogWarning($"[VRArenaSetup] BlockData InstallWithDependencies faulted: {task.Exception?.GetBaseException()?.Message}");
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[VRArenaSetup] BlockData reflection install threw: {e.Message}");
+            return false;
+        }
+    }
+
+    private static void ManualInstallSyntheticHands()
+    {
+        GameObject leftPrefab  = AssetDatabase.LoadAssetAtPath<GameObject>(AssetDatabase.GUIDToAssetPath(BBLeftHandSyntheticGuid));
+        GameObject rightPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(AssetDatabase.GUIDToAssetPath(BBRightHandSyntheticGuid));
+        if (leftPrefab == null || rightPrefab == null)
+        {
+            Debug.LogError("[VRArenaSetup] [BB] Synthetic Hand prefabs missing from Meta Interaction OVR package.");
+            return;
+        }
+
+        var hands = Object.FindObjectsByType<Oculus.Interaction.Input.Hand>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var hand in hands)
+        {
+            // Walk up to the [BuildingBlock] Hand Tracking root
+            Transform blockRoot = hand.transform;
+            int depth = 0;
+            while (blockRoot != null && !blockRoot.name.StartsWith("[BuildingBlock] Hand Tracking") && depth++ < 8)
+                blockRoot = blockRoot.parent;
+            if (blockRoot == null || !blockRoot.name.StartsWith("[BuildingBlock] Hand Tracking")) continue;
+
+            // Skip if already added
+            bool already = false;
+            foreach (Transform c in blockRoot) if (c.name.Contains("Synthetic")) { already = true; break; }
+            if (already) continue;
+
+            bool isLeft = hand.Handedness == Oculus.Interaction.Input.Handedness.Left;
+            GameObject prefab = isLeft ? leftPrefab : rightPrefab;
+            GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab, blockRoot);
+            instance.SetActive(true);
+            instance.name = $"[BuildingBlock] Synthetic {hand.Handedness} Hand";
+
+            var synthetic = instance.GetComponent<Oculus.Interaction.Input.SyntheticHand>();
+            if (synthetic != null)
+            {
+                synthetic.InjectModifyDataFromSource(hand);
+                // Wire HandVisual / IHand fields inside the synthetic
+                WireIHandRefsRecursively(instance, synthetic);
+            }
+
+            // Disable raw hand visuals on the hand tracking block
+            var skel = blockRoot.GetComponent<OVRSkeletonRenderer>(); if (skel != null) skel.enabled = false;
+            var mesh = blockRoot.GetComponent<OVRMeshRenderer>(); if (mesh != null) mesh.enabled = false;
+            var skin = blockRoot.GetComponent<SkinnedMeshRenderer>(); if (skin != null) skin.enabled = false;
+
+            EditorUtility.SetDirty(instance);
+            EditorUtility.SetDirty(blockRoot.gameObject);
+        }
+    }
+
+    private static void WireIHandRefsRecursively(GameObject root, Oculus.Interaction.Input.SyntheticHand source)
+    {
+        // Many HandVisual / hand-data consumers expose a serialized `_hand` IHand reference.
+        // Set any null `_hand` field on MonoBehaviours under the synthetic to point at our SyntheticHand.
+        var mbs = root.GetComponentsInChildren<MonoBehaviour>(true);
+        foreach (var mb in mbs)
+        {
+            if (mb == null) continue;
+            var so = new SerializedObject(mb);
+            var prop = so.FindProperty("_hand");
+            if (prop != null && prop.propertyType == SerializedPropertyType.ObjectReference && prop.objectReferenceValue == null)
+            {
+                prop.objectReferenceValue = source;
+                so.ApplyModifiedPropertiesWithoutUndo();
+            }
+        }
+    }
+
+    private const string TacticalGloveMatPath = MaterialsDir + "/TacticalGloveMat.mat";
+    private const string TacticalKnuckleMatPath = MaterialsDir + "/TacticalKnuckleMat.mat";
+    private const string HandsModelsDir = "Assets/Models/Hands";
+
+    [MenuItem("Tools/VR Arena/Revert Hands To Default Controllers")]
+    public static void RevertHandsToDefault()
+    {
+        int removed = 0;
+        var all = Object.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+
+        // 1) Destroy tactical glove instances
+        foreach (var go in all)
+        {
+            if (go == null) continue;
+            if (go.name.StartsWith("TacticalGlove_")) { Object.DestroyImmediate(go); removed++; }
+        }
+
+        // 2) Destroy synthetic hand instances we added (BB Synthetic) — leaves base Hand Tracking BB intact
+        foreach (var go in all)
+        {
+            if (go == null) continue;
+            if (go.name.Contains("Synthetic") && go.name.Contains("Hand")) { Object.DestroyImmediate(go); removed++; }
+        }
+
+        // 3) Remove runtime hider so renderers can re-enable themselves
+        var rig = Object.FindFirstObjectByType<OVRCameraRig>();
+        if (rig != null)
+        {
+            var hider = rig.GetComponent<MetaHandVisualHider>();
+            if (hider != null) Object.DestroyImmediate(hider);
+
+            // 4) Re-enable every renderer under the rig
+            var renderers = rig.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in renderers) if (r != null) r.enabled = true;
+
+            // 5) Re-enable OVR mesh / skeleton renderers on Hand Tracking blocks
+            foreach (Transform child in rig.transform.GetComponentsInChildren<Transform>(true))
+            {
+                if (child == null) continue;
+                var skin = child.GetComponent<SkinnedMeshRenderer>(); if (skin != null) skin.enabled = true;
+                var ovrMesh = child.GetComponent<OVRMeshRenderer>(); if (ovrMesh != null) ovrMesh.enabled = true;
+                var ovrSkel = child.GetComponent<OVRSkeletonRenderer>(); if (ovrSkel != null) ovrSkel.enabled = true;
+            }
+        }
+
+        // 6) Also re-enable any OVRControllerHelper child renderers globally
+        var helpers = Object.FindObjectsByType<OVRControllerHelper>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var h in helpers)
+        {
+            var renderers = h.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in renderers) if (r != null) r.enabled = true;
+        }
+
+        // 7) Revert OVRManager flags I'd touched for multimodal hands
+        var manager = Object.FindFirstObjectByType<OVRManager>();
+        if (manager != null)
+        {
+            var so = new SerializedObject(manager);
+            var cdhp = so.FindProperty("controllerDrivenHandPosesType");
+            if (cdhp != null) cdhp.intValue = 0; // None
+            var simul = so.FindProperty("launchSimultaneousHandsControllersOnStartup");
+            if (simul != null) simul.boolValue = false;
+            so.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(manager);
+        }
+
+        UnityEditor.SceneManagement.EditorSceneManager.MarkAllScenesDirty();
+        Debug.Log($"[VRArenaSetup] Reverted hands — destroyed {removed} glove/synthetic objects, re-enabled all rig renderers, removed runtime hider, restored OVRManager flags. Default Quest controllers should be visible again.");
+    }
+
+    [MenuItem("Tools/VR Arena/Gloves: Flip 180° around Y")] public static void FlipGlovesY() => RotateGloves(0, 180, 0);
+    [MenuItem("Tools/VR Arena/Gloves: Flip 180° around X")] public static void FlipGlovesX() => RotateGloves(180, 0, 0);
+    [MenuItem("Tools/VR Arena/Gloves: Flip 180° around Z")] public static void FlipGlovesZ() => RotateGloves(0, 0, 180);
+    [MenuItem("Tools/VR Arena/Gloves: Rotate +90° around Y")] public static void RotateGlovesY90() => RotateGloves(0, 90, 0);
+    [MenuItem("Tools/VR Arena/Re-Hide All Meta Hand Visuals")] public static void RehideMeta() => HideAllMetaHandVisuals();
+
+    private static void RotateGloves(float x, float y, float z)
+    {
+        var all = Object.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        int n = 0;
+        foreach (var go in all)
+        {
+            if (go == null || !go.name.StartsWith("TacticalGlove_")) continue;
+            go.transform.localRotation = go.transform.localRotation * Quaternion.Euler(x, y, z);
+            EditorUtility.SetDirty(go);
+            n++;
+        }
+        UnityEditor.SceneManagement.EditorSceneManager.MarkAllScenesDirty();
+        Debug.Log($"[VRArenaSetup] Rotated {n} tactical glove(s) by ({x},{y},{z}).");
+    }
+
+    [MenuItem("Tools/VR Arena/Install Tactical Gloves From Zip")]
+    public static void InstallTacticalGlovesFromZip()
+    {
+        EnsureFolder("Assets/Models");
+        EnsureFolder(HandsModelsDir);
+
+        // 1) First try: is there already an extracted FBX/GLB in Assets/Models/Hands/?
+        //    (Unity may have auto-extracted the Sketchfab zip on drop.)
+        string modelRel = FindFirstHandModelUnder(HandsModelsDir);
+
+        // 2) If nothing extracted yet, hunt for a zip and extract it ourselves
+        if (modelRel == null)
+        {
+            string zipPath = FindGloveZip();
+            if (zipPath == null)
+            {
+                Debug.LogError($"[VRArenaSetup] No glove FBX/GLB and no zip found.\n" +
+                               $"Drop the Sketchfab zip (or extracted FBX/GLB) into '{HandsModelsDir}/'.");
+                return;
+            }
+            Debug.Log($"[VRArenaSetup] Found glove archive: {zipPath}");
+            string archiveName = Path.GetFileNameWithoutExtension(zipPath);
+            string extractDir = HandsModelsDir + "/" + SanitizeName(archiveName);
+            try
+            {
+                Directory.CreateDirectory(extractDir);
+                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
+                Debug.Log($"[VRArenaSetup] Extracted {Path.GetFileName(zipPath)} → {extractDir}");
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"[VRArenaSetup] Zip extraction failed: {e.Message}\n{e.StackTrace}");
+                return;
+            }
+            AssetDatabase.Refresh();
+            modelRel = FindFirstHandModelUnder(HandsModelsDir);
+        }
+
+        if (modelRel == null)
+        {
+            Debug.LogError($"[VRArenaSetup] No .fbx / .glb / .gltf file inside {HandsModelsDir}/ after extraction.");
+            return;
+        }
+        Debug.Log($"[VRArenaSetup] Using hand model asset: {modelRel}");
+
+        // 3) Configure importer where applicable (FBX uses ModelImporter; GLB uses a ScriptedImporter and we leave defaults)
+        var importer = AssetImporter.GetAtPath(modelRel) as ModelImporter;
+        if (importer != null)
+        {
+            importer.materialImportMode = ModelImporterMaterialImportMode.ImportStandard;
+            importer.SearchAndRemapMaterials(ModelImporterMaterialName.BasedOnTextureName, ModelImporterMaterialSearch.RecursiveUp);
+            importer.SaveAndReimport();
+        }
+        GameObject modelAsset = AssetDatabase.LoadAssetAtPath<GameObject>(modelRel);
+        if (modelAsset == null) { Debug.LogError($"[VRArenaSetup] Could not load model as GameObject: {modelRel}"); return; }
+
+        // alias the rest of the routine to the new var name
+        GameObject fbxAsset = modelAsset;
+
+        // 5) Find controller anchors on the OVRCameraRig
+        var rig = Object.FindFirstObjectByType<OVRCameraRig>();
+        if (rig == null) { Debug.LogError("[VRArenaSetup] No OVRCameraRig in scene."); return; }
+
+        Transform leftAnchor  = rig.transform.Find("TrackingSpace/LeftControllerAnchor");
+        Transform rightAnchor = rig.transform.Find("TrackingSpace/RightControllerAnchor");
+        if (leftAnchor == null)  leftAnchor  = rig.transform.Find("TrackingSpace/LeftHandAnchor");
+        if (rightAnchor == null) rightAnchor = rig.transform.Find("TrackingSpace/RightHandAnchor");
+        if (leftAnchor == null || rightAnchor == null)
+        {
+            Debug.LogError("[VRArenaSetup] Could not locate Left/Right ControllerAnchor or HandAnchor under TrackingSpace.");
+            return;
+        }
+
+        // 6) Hide everything Meta normally shows on the hands (edit-time pass)
+        HideAllMetaHandVisuals();
+        // 6b) Add runtime hider so Meta SDK can't re-enable the renderers in Play mode
+        if (rig.GetComponent<MetaHandVisualHider>() == null)
+        {
+            rig.gameObject.AddComponent<MetaHandVisualHider>();
+            EditorUtility.SetDirty(rig);
+        }
+
+        // 7) Clean any previously-attached tactical gloves on these anchors
+        foreach (var anchor in new[] { leftAnchor, rightAnchor })
+        {
+            for (int i = anchor.childCount - 1; i >= 0; i--)
+            {
+                var c = anchor.GetChild(i);
+                if (c != null && c.name.StartsWith("TacticalGlove_")) Object.DestroyImmediate(c.gameObject);
+            }
+        }
+
+        // 8) Sketchfab models commonly land in cm (100x too big) or m — we default to 0.01 then
+        //    auto-fit so the longest axis is ~14cm (typical hand length). User can tune later.
+        AttachAndAutoFitGlove(fbxAsset, rightAnchor, isLeft: false);
+        AttachAndAutoFitGlove(fbxAsset, leftAnchor,  isLeft: true);
+
+        // 9) Write attribution for CC-BY models
+        WriteAttribution(modelRel);
+
+        UnityEditor.SceneManagement.EditorSceneManager.MarkAllScenesDirty();
+        Debug.Log("[VRArenaSetup] Tactical gloves wired to controller anchors. " +
+                  "Tune position/rotation in the inspector if grip alignment looks off.");
+    }
+
+    private static string FindFirstHandModelUnder(string folder)
+    {
+        if (!Directory.Exists(folder)) return null;
+        // Prefer FBX → GLB → GLTF
+        string[] exts = new[] { "*.fbx", "*.glb", "*.gltf" };
+        string projectRoot = Path.GetFullPath(".").Replace('\\', '/').TrimEnd('/');
+        foreach (var ext in exts)
+        {
+            string[] hits = Directory.GetFiles(folder, ext, SearchOption.AllDirectories);
+            if (hits.Length == 0) continue;
+            // Skip our own setup tracer/muzzle prefabs, just in case
+            foreach (var hit in hits)
+            {
+                string rel = hit.Replace('\\', '/');
+                if (rel.StartsWith(projectRoot + "/")) rel = rel.Substring(projectRoot.Length + 1);
+                if (!rel.StartsWith("Assets/")) continue;
+                if (rel.Contains("/Prefabs/")) continue;
+                return rel;
+            }
+        }
+        return null;
+    }
+
+    private static string FindGloveZip()
+    {
+        var candidates = new System.Collections.Generic.List<string>();
+        if (Directory.Exists(HandsModelsDir))
+            candidates.AddRange(Directory.GetFiles(HandsModelsDir, "*.zip", SearchOption.AllDirectories));
+        candidates.AddRange(Directory.GetFiles(".", "*.zip", SearchOption.TopDirectoryOnly));
+        // Also check the user's Downloads folder as a last resort
+        string downloads = System.Environment.ExpandEnvironmentVariables("%USERPROFILE%/Downloads");
+        if (Directory.Exists(downloads))
+            candidates.AddRange(Directory.GetFiles(downloads, "*.zip", SearchOption.TopDirectoryOnly));
+
+        foreach (var z in candidates)
+        {
+            string n = Path.GetFileName(z).ToLowerInvariant();
+            if (n.Contains("glove") || n.Contains("tactical") || n.Contains("hand"))
+                return z.Replace('\\', '/');
+        }
+        return null;
+    }
+
+    private static string SanitizeName(string s)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+        return s.Replace(' ', '_');
+    }
+
+    private static void HideAllMetaHandVisuals()
+    {
+        // Aggressive: kill ANY renderer under the OVR rig that isn't our own TacticalGlove_*
+        var rig = Object.FindFirstObjectByType<OVRCameraRig>();
+        if (rig != null)
+        {
+            var allRenderers = rig.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in allRenderers)
+            {
+                if (r == null) continue;
+                if (IsUnderTacticalGlove(r.transform)) continue;
+                r.enabled = false;
+            }
+        }
+
+        // Also deactivate the [BuildingBlock] Synthetic Hand roots so their colliders / handlers stop running
+        var all = Object.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var go in all)
+        {
+            if (go == null) continue;
+            if (IsUnderTacticalGlove(go.transform)) continue;
+            // Catch synthetic hand instances + any HandVisual GO in the rig
+            if (go.name.Contains("Synthetic") && go.name.Contains("Hand")) go.SetActive(false);
+        }
+
+        // Disable OVRControllerHelper visuals globally (catches helpers outside the rig too)
+        var helpers = Object.FindObjectsByType<OVRControllerHelper>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var h in helpers)
+        {
+            var renderers = h.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in renderers) if (!IsUnderTacticalGlove(r.transform)) r.enabled = false;
+        }
+    }
+
+    private static bool IsUnderTacticalGlove(Transform t)
+    {
+        while (t != null)
+        {
+            if (t.name.StartsWith("TacticalGlove_")) return true;
+            t = t.parent;
+        }
+        return false;
+    }
+
+    private static void AttachAndAutoFitGlove(GameObject fbxAsset, Transform anchor, bool isLeft)
+    {
+        GameObject glove = (GameObject)PrefabUtility.InstantiatePrefab(fbxAsset, anchor);
+        glove.name = "TacticalGlove_" + (isLeft ? "L" : "R");
+        glove.transform.localPosition = Vector3.zero;
+        glove.transform.localRotation = Quaternion.identity;
+        glove.transform.localScale = Vector3.one;
+
+        // Measure bounds in local space, then scale so longest axis ≈ 14 cm
+        Renderer[] renderers = glove.GetComponentsInChildren<Renderer>(true);
+        if (renderers.Length == 0)
+        {
+            Debug.LogWarning("[VRArenaSetup] Glove FBX has no renderers — skipping auto-fit.");
+            return;
+        }
+        Bounds b = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++) b.Encapsulate(renderers[i].bounds);
+        float longest = Mathf.Max(b.size.x, Mathf.Max(b.size.y, b.size.z));
+        if (longest < 0.0001f) longest = 1f;
+        const float TARGET_HAND_LEN = 0.14f;
+        float scale = TARGET_HAND_LEN / longest;
+
+        // Orient so fingers point along controller +Z (away from the user) and palm rotates inward
+        // for a grip. Previous default had hands facing the camera — flipped 180° around Y.
+        glove.transform.localPosition = new Vector3(0f, -0.02f, 0.04f);
+        glove.transform.localRotation = Quaternion.Euler(0f, isLeft ? -90f : 90f, isLeft ? -90f : 90f);
+        glove.transform.localScale = new Vector3(isLeft ? -scale : scale, scale, scale);
+
+        EditorUtility.SetDirty(glove);
+    }
+
+    private static void WriteAttribution(string fbxRel)
+    {
+        // CC-BY requires attribution — drop a credits.txt at project root so it's not lost
+        string credits = Path.Combine(".", "ASSET_ATTRIBUTIONS.txt");
+        string existing = File.Exists(credits) ? File.ReadAllText(credits) : "";
+        string entry = $"\n# Tactical Gloves\n# Source FBX: {fbxRel}\n# License: Creative Commons Attribution (CC-BY 4.0)\n# Author: see Sketchfab page — credit creator in your build's credits screen.\n";
+        if (!existing.Contains("# Tactical Gloves"))
+        {
+            File.WriteAllText(credits, existing + entry);
+            Debug.Log($"[VRArenaSetup] Attribution recorded in {credits}");
+        }
+    }
+
+
+    [MenuItem("Tools/VR Arena/Apply Tactical Glove Look")]
+    public static void ApplyTacticalGloveLook()
+    {
+        EnsureFolder(MaterialsDir);
+        Material gloveMat = CreateOrLoadGloveMaterial(TacticalGloveMatPath, new Color(0.05f, 0.05f, 0.06f), smoothness: 0.18f);
+        Material knuckleMat = CreateOrLoadGloveMaterial(TacticalKnuckleMatPath, new Color(0.10f, 0.10f, 0.11f), smoothness: 0.32f);
+
+        int handsTouched = 0;
+        var roots = Object.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
+        foreach (var go in roots)
+        {
+            if (go == null) continue;
+            if (!go.name.Contains("Synthetic") || !go.name.Contains("Hand")) continue;
+            if (go.transform.parent == null) continue; // skip non-rigged stray objects
+
+            // Bulk up the glove visual ~10% so it reads as a tactical glove instead of a skinny civilian hand
+            // Apply on the synthetic hand root so colliders + hand visual scale together
+            var t = go.transform;
+            if (Mathf.Approximately(t.localScale.x, 1f))
+                t.localScale = Vector3.one * 1.08f;
+
+            var skins = go.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            foreach (var smr in skins)
+            {
+                if (smr == null) continue;
+                int submeshCount = smr.sharedMaterials != null ? smr.sharedMaterials.Length : 1;
+                var mats = new Material[submeshCount];
+                for (int i = 0; i < submeshCount; i++)
+                {
+                    // Alternate primary glove + knuckle accent if multiple submeshes; otherwise all glove
+                    mats[i] = (submeshCount > 1 && i == 1) ? knuckleMat : gloveMat;
+                }
+                smr.sharedMaterials = mats;
+                EditorUtility.SetDirty(smr);
+            }
+            handsTouched++;
+        }
+
+        UnityEditor.SceneManagement.EditorSceneManager.MarkAllScenesDirty();
+        Debug.Log($"[VRArenaSetup] Tactical glove look applied to {handsTouched} synthetic hand(s).");
+    }
+
+    private static Material CreateOrLoadGloveMaterial(string path, Color baseColor, float smoothness)
+    {
+        Material mat = AssetDatabase.LoadAssetAtPath<Material>(path);
+        Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
+        if (mat == null)
+        {
+            mat = new Material(urpLit ?? Shader.Find("Standard"));
+            AssetDatabase.CreateAsset(mat, path);
+        }
+        else if (urpLit != null && mat.shader != urpLit)
+        {
+            mat.shader = urpLit;
+        }
+        mat.color = baseColor;
+        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", baseColor);
+        if (mat.HasProperty("_Smoothness")) mat.SetFloat("_Smoothness", smoothness);
+        if (mat.HasProperty("_Glossiness")) mat.SetFloat("_Glossiness", smoothness);
+        if (mat.HasProperty("_Metallic")) mat.SetFloat("_Metallic", 0f);
+        // Slight tactical-fabric emission so the gloves don't disappear in shadow
+        if (mat.HasProperty("_EmissionColor"))
+        {
+            mat.SetColor("_EmissionColor", baseColor * 0.15f);
+            mat.EnableKeyword("_EMISSION");
+            mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+        }
+        EditorUtility.SetDirty(mat);
+        return mat;
+    }
+
+    private static void EnableMultimodalControllerDrivenHands()
+    {
+        // 1) Force project config to ControllersAndHands so the manifest declares hand tracking + multimodal works.
+        try
+        {
+            var cfg = OVRProjectConfig.CachedProjectConfig;
+            if (cfg != null)
+            {
+                if (cfg.handTrackingSupport != OVRProjectConfig.HandTrackingSupport.ControllersAndHands)
+                {
+                    cfg.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
+                    EditorUtility.SetDirty(cfg);
+                }
+            }
+        }
+        catch (System.Exception e) { Debug.LogWarning($"[VRArenaSetup] OVRProjectConfig handTrackingSupport set failed: {e.Message}"); }
+
+        // 2) Force OVRManager into ConformingToController + multimodal-on-startup so synthetic hands
+        //    get a pose even while the controllers are held.
+        var manager = Object.FindFirstObjectByType<OVRManager>();
+        if (manager == null) return;
+
+        var so = new SerializedObject(manager);
+
+        // 0 = None, 1 = Natural, 2 = ConformingToController
+        var cdhpProp = so.FindProperty("controllerDrivenHandPosesType");
+        if (cdhpProp != null) cdhpProp.intValue = 2;
+
+        // The runtime flag that actually flips OVRPlugin into multimodal on startup
+        var simul = so.FindProperty("launchSimultaneousHandsControllersOnStartup");
+        if (simul != null) simul.boolValue = true;
+
+        so.ApplyModifiedPropertiesWithoutUndo();
+        EditorUtility.SetDirty(manager);
     }
 }

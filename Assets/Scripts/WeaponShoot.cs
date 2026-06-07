@@ -1,4 +1,5 @@
 using UnityEngine;
+using System.Collections;
 using Oculus.Interaction;
 
 [RequireComponent(typeof(Grabbable))]
@@ -23,8 +24,15 @@ public class WeaponShoot : MonoBehaviour
     [Header("Ammo")]
     [SerializeField] private int maxAmmo = 30;
     [SerializeField] private int currentAmmo = 30;
+    [SerializeField] private int reserveAmmo = -1; // spare rounds; -1 = infinite (default keeps MainScene unchanged)
     [SerializeField] private float reloadDuration = 1.5f;
     [SerializeField] private AudioSource reloadSound;
+    [SerializeField] private float dryFireCooldown = 3f; // empty-click won't repeat faster than this
+
+    [Header("Reload Animation")]
+    [SerializeField] private Transform magazine;          // ejects/inserts during reload
+    [SerializeField] private float reloadDipDepth = 0.04f; // how far the gun dips while reloading
+    [SerializeField] private float magEjectDrop = 0.14f;   // how far the mag drops out
 
     [Header("Recoil")]
     [SerializeField] private float recoilKick = 0.04f;
@@ -37,16 +45,24 @@ public class WeaponShoot : MonoBehaviour
 
     private Grabbable grabbable;
     private float nextFireTime;
+    private float nextDryFireTime;
     private bool isHeld;
     private bool prevTrigger;
     private Vector3 recoilOffset;
     private Vector3 recoilRot;
+    private Vector3 reloadPos;
+    private Vector3 reloadRot;
+    private Vector3 magBaseLocalPos;
+    private bool magCaptured;
     private Transform visualRoot;
     private Collider[] selfColliders;
 
     public int CurrentAmmo => currentAmmo;
     public int MaxAmmo => maxAmmo;
+    public int ReserveAmmo => reserveAmmo;
+    public bool IsHeld => isHeld;
     public bool IsReloading => isReloading;
+    public void AddAmmo(int rounds) { if (reserveAmmo < 0 || rounds <= 0) return; reserveAmmo += rounds; }
     public int ShotsFired { get; private set; }
     public int ShotsHit { get; private set; }
 
@@ -55,7 +71,7 @@ public class WeaponShoot : MonoBehaviour
 
     public static event System.Action<Vector3, Vector3, float, IDamageable> OnShotHit;
 
-    public void TriggerReload() { if (!isReloading && currentAmmo < maxAmmo) BeginReload(); }
+    public void TriggerReload() { if (!isReloading && currentAmmo < maxAmmo && reserveAmmo != 0) BeginReload(); }
 
     void Awake()
     {
@@ -86,7 +102,14 @@ public class WeaponShoot : MonoBehaviour
 
         if (isReloading)
         {
-            if (Time.time >= reloadEndTime) { isReloading = false; currentAmmo = maxAmmo; }
+            if (Time.time >= reloadEndTime)
+            {
+                isReloading = false;
+                int need = maxAmmo - currentAmmo;
+                int take = reserveAmmo < 0 ? need : Mathf.Min(need, reserveAmmo);
+                currentAmmo += take;
+                if (reserveAmmo > 0) reserveAmmo -= take;
+            }
             return;
         }
 
@@ -111,16 +134,20 @@ public class WeaponShoot : MonoBehaviour
         prevTrigger = trigger;
 
         if (!shouldFire) return;
-        if (Time.time < nextFireTime) return;
-
-        nextFireTime = Time.time + fireRate;
 
         if (currentAmmo <= 0)
         {
-            if (dryFireSound != null && dryFireSound.clip != null) dryFireSound.PlayOneShot(dryFireSound.clip);
+            // empty: play the dry-fire click once, then not again for dryFireCooldown seconds
+            if (Time.time >= nextDryFireTime)
+            {
+                if (dryFireSound != null && dryFireSound.clip != null) dryFireSound.PlayOneShot(dryFireSound.clip);
+                nextDryFireTime = Time.time + dryFireCooldown;
+            }
             return;
         }
 
+        if (Time.time < nextFireTime) return;
+        nextFireTime = Time.time + fireRate;
         Fire();
     }
 
@@ -129,6 +156,34 @@ public class WeaponShoot : MonoBehaviour
         isReloading = true;
         reloadEndTime = Time.time + reloadDuration;
         if (reloadSound != null && reloadSound.clip != null) reloadSound.PlayOneShot(reloadSound.clip);
+        StartCoroutine(ReloadRoutine());
+    }
+
+    // Procedural reload: the gun dips + tilts, the magazine drops out and a fresh one slides
+    // back in over the reload time. Model-agnostic (no rigged reload needed).
+    IEnumerator ReloadRoutine()
+    {
+        if (magazine != null && !magCaptured) { magBaseLocalPos = magazine.localPosition; magCaptured = true; }
+        float dur = Mathf.Max(0.3f, reloadDuration);
+        float t = 0f;
+        while (t < dur)
+        {
+            t += Time.deltaTime;
+            float n = Mathf.Clamp01(t / dur);
+            float pose = n < 0.3f ? n / 0.3f : (n > 0.7f ? 1f - (n - 0.7f) / 0.3f : 1f);
+            reloadPos = new Vector3(0f, -reloadDipDepth, 0f) * pose;
+            reloadRot = new Vector3(18f, 0f, -12f) * pose;
+
+            if (magazine != null)
+            {
+                float magOut = n < 0.4f ? n / 0.4f : (n < 0.6f ? 1f : 1f - (n - 0.6f) / 0.4f);
+                magazine.localPosition = magBaseLocalPos + Vector3.down * (magEjectDrop * magOut);
+            }
+            yield return null;
+        }
+        reloadPos = Vector3.zero;
+        reloadRot = Vector3.zero;
+        if (magazine != null) magazine.localPosition = magBaseLocalPos;
     }
 
     void Fire()
@@ -218,8 +273,8 @@ public class WeaponShoot : MonoBehaviour
         recoilRot = Vector3.Lerp(recoilRot, Vector3.zero, Time.deltaTime * recoilRecoverSpeed);
         if (visualRoot != null && visualRoot != transform)
         {
-            visualRoot.localPosition = recoilOffset;
-            visualRoot.localEulerAngles = recoilRot;
+            visualRoot.localPosition = recoilOffset + reloadPos;
+            visualRoot.localEulerAngles = recoilRot + reloadRot;
         }
     }
 
