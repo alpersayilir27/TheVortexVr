@@ -1,0 +1,26 @@
+# .augmentignore — Augment söz dizimi .gitignore ile aynıdır.
+#
+# ÖNEMLİ: Buradaki kalıplar dosyaları index'ten TAMAMEN çıkarır; Augment
+# bu dosyaların ADINI bile bilmez. Bu yüzden burada SADECE kimsenin ad
+# bilgisine ihtiyaç duymadığı, üretilmiş cache/build klasörlerini listeliyoruz.
+#
+# Binary varlıklar (.png, .wav, .fbx, .glb, .ttf, .dll vb.) BİLEREK burada
+# YOK: Augment onların adını workspace'te görmeye devam etsin, ama içeriklerini
+# zaten gömmediği/okumadığı için ekstra bir kural gerekmiyor.
+# (İçeriğin OKUNMASINI engelleme tarafı Claude'da .claude/settings.json
+#  içindeki Read(...) deny kurallarıyla yapılıyor.)
+
+# ---- Üretilmiş cache / build klasörleri (adları gereksiz) ----
+Library/
+Temp/
+Obj/
+obj/
+Build/
+Builds/
+Logs/
+UserSettings/
+.vs/
+.gradle/
+MemoryCaptures/
+Recordings/
+.utmp/
